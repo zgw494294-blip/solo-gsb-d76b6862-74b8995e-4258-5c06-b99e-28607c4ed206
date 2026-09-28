@@ -1,7 +1,8 @@
 # 量纲公式求值 API
 
 离线运行的量纲公式求值服务：接收一个算术算式、一组带单位的变量和一个目标单位，
-按单位代数（dimensional algebra）求值并把结果换算到目标单位，返回数值与量纲。
+按单位代数（dimensional algebra）求值并把结果换算到目标单位，返回数值与量纲；
+也支持给出期望结果，在有限数值区间上对单个变量做目标值反求（二分法）。
 
 技术栈：Python 3.11+ · FastAPI · Pint · Uvicorn。全程本地计算，不访问任何外部服务。
 
@@ -13,7 +14,8 @@ docker compose up --build
 
 服务启动后监听本地 **8000** 端口：
 
-- 接口地址：`http://localhost:8000/v1/evaluate`
+- 正向求值：`http://localhost:8000/v1/evaluate`
+- 目标值反求：`http://localhost:8000/v1/invert`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/healthz`
 
@@ -68,6 +70,102 @@ curl -X POST http://localhost:8000/v1/evaluate \
                      "d": {"value": 18, "unit": "delta_degF"}},
        "target_unit": "degC"}'
 # => {"value": 20.0, "unit": "degC", "dimension": "[temperature]"}
+```
+
+### `POST /v1/invert`
+
+目标值反求：给定算式、已知变量、一个待求变量（名称、单位、严格递增的有限
+数值区间）以及期望结果（目标值与目标单位），用二分法求待求变量的取值。
+
+- 待求变量必须在算式中出现（可出现多次），且不能与 `variables` 中的已知变量重名。
+- 求解完全沿用正向求值的语法、单位换算与绝对温度规则。
+- **先检查区间两端点**：任一端点结果已在容差内即直接返回；两端点结果与目标值
+  之差**不构成异号括区**时返回 422（不猜测、不外推）。
+- 构成括区后仅对该区间二分，**最多迭代 100 次**；遇到零除、量纲错误、非有限
+  结果等间断/非法情形立即返回 422，**不把间断点当作解**。
+- 收敛判据：`|实际结果 - 目标值| ≤ 1e-8 × max(1, |目标值|)`；100 次后仍不满足
+  返回 422（有限精度下区间无法继续二分同样视为未收敛）。
+
+请求体：
+
+```json
+{
+  "expression": "dist / time",
+  "variables": { "dist": { "value": 36, "unit": "km" } },
+  "unknown": { "name": "time", "unit": "h", "bounds": [0.1, 10] },
+  "target":  { "value": 5, "unit": "m/s" }
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `expression` | 同 `/v1/evaluate` 的算式 |
+| `variables` | 已知变量名 → `{value, unit}`（同正向求值） |
+| `unknown.name` | 待求变量名：合法标识符，须在算式中出现且不与已知变量重名 |
+| `unknown.unit` | 待求变量的单位（单位表中的**单个**单位；`bounds` 是该刻度下的数值） |
+| `unknown.bounds` | 严格递增的有限数值区间 `[下限, 上限]`（拒绝 inf/NaN/布尔/长度不为 2） |
+| `target.value` | 期望结果的有限数值（拒绝 inf/NaN/布尔） |
+| `target.unit` | 目标单位：规则同正向求值的 `target_unit`（可复合、可幂、可为 `1`） |
+
+成功响应 `200`：
+
+```json
+{ "value": 2.000000007450581, "unit": "h",
+  "actual_value": 4.999999981373548, "actual_unit": "m/s" }
+```
+
+- `value`：求得的待求变量数值（按 `unknown.unit` 刻度）
+- `unit`：待求变量的单位（即 `unknown.unit`）
+- `actual_value`：把待求值代回算式后按目标单位换算的实际结果（与 `target.value`
+  的差不超过容差）
+- `actual_unit`：归一化后的目标单位
+
+可执行示例：
+
+```bash
+# 36 km 的路程，想要 5 m/s 的速度，反求所需时间（小时）：约 2 h
+curl -X POST http://localhost:8000/v1/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"expression": "dist / time",
+       "variables": {"dist": {"value": 36, "unit": "km"}},
+       "unknown": {"name": "time", "unit": "h", "bounds": [0.1, 10]},
+       "target": {"value": 5, "unit": "m/s"}}'
+# => {"value":2.0000000074...,"unit":"h","actual_value":4.9999999813...,"actual_unit":"m/s"}
+
+# 反求绝对温度：多少 degC 等于 68 degF —— 20 degC（仿射换算）
+curl -X POST http://localhost:8000/v1/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"expression": "t",
+       "unknown": {"name": "t", "unit": "degC", "bounds": [0, 40]},
+       "target": {"value": 68, "unit": "degF"}}'
+# => {"value":20.0,"unit":"degC","actual_value":68.0,"actual_unit":"degF"}
+
+# 端点恰好命中：x + b 在 x=0 处已等于 1 m，直接返回端点
+curl -X POST http://localhost:8000/v1/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"expression": "x + b",
+       "variables": {"b": {"value": 1, "unit": "m"}},
+       "unknown": {"name": "x", "unit": "m", "bounds": [0, 10]},
+       "target": {"value": 1, "unit": "m"}}'
+# => {"value":0.0,"unit":"m","actual_value":1.0,"actual_unit":"m"}
+
+# 端点不构成异号括区：x*x 在 [1 s, 2 s] 恒正，目标 -1 s^2 -> 422
+curl -s -X POST http://localhost:8000/v1/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"expression": "x * x",
+       "unknown": {"name": "x", "unit": "s", "bounds": [1, 2]},
+       "target": {"value": -1, "unit": "s^2"}}'
+# => {"detail":[{"type":"no_bracketing_interval",
+#                "loc":["body","unknown","bounds"], ...}]}
+
+# 间断点不当作解：1/x 在 [-1 s, 1 s] 端点异号，但中点 x=0 是极点 -> 422
+curl -s -X POST http://localhost:8000/v1/invert \
+  -H 'Content-Type: application/json' \
+  -d '{"expression": "1 / x",
+       "unknown": {"name": "x", "unit": "s", "bounds": [-1, 1]},
+       "target": {"value": 0, "unit": "1/s"}}'
+# => {"detail":[{"type":"division_by_zero",
+#                "loc":["body","expression",2],"msg":"位置 2：除数为零"}]}
 ```
 
 ## 支持的单位
@@ -125,7 +223,23 @@ curl -X POST http://localhost:8000/v1/evaluate \
 | `invalid_target_unit` | 目标单位式非法 | `["body","target_unit",3]` |
 | `non_finite_result` | 求值结果溢出为非有限值 | `["body","expression"]` |
 
-请求体本身不合法（缺字段、类型错误、非有限数值等）同样返回 422，
+`/v1/invert` 额外的错误类型（同样返回 422）：
+
+| `type` | 含义 | `loc` 示例 |
+| --- | --- | --- |
+| `invalid_identifier` | 待求变量名不是合法标识符 | `["body","unknown","name"]` |
+| `duplicate_variable` | 待求变量与已知变量重名 | `["body","unknown","name"]` |
+| `unknown_not_in_expression` | 待求变量没有在算式中出现 | `["body","expression",4]` |
+| `invalid_interval` | 区间不是严格递增的两个端点 | `["body","unknown","bounds"]` |
+| `no_bracketing_interval` | 两端点结果与目标值之差不构成异号括区 | `["body","unknown","bounds"]` |
+| `not_converged` | 二分 100 次（或有限精度下区间无法继续二分）仍未进入容差 | `["body","unknown","bounds"]` |
+
+反求过程中算式求值产生的错误（`division_by_zero`、`incompatible_units`、
+`absolute_temperature`、`non_finite_result` 等）沿用正向求值的类型与定位；
+目标单位相关错误的定位前缀为 `["body","target","unit", ...]`。端点或二分中点
+处出现零除/量纲错误均直接返回该错误，不会把间断点当作解。
+
+请求体本身不合法（缺字段、类型错误、非有限数值、`bounds` 长度不为 2 等）同样返回 422，
 由 FastAPI/Pydantic 给出字段级定位。
 
 ## 测试
@@ -139,14 +253,16 @@ pytest
 
 ```
 app/
-  main.py        FastAPI 应用与路由（POST /v1/evaluate、GET /healthz）
-  models.py      请求/响应模型（有限数值校验）
-  expression.py  算式词法/语法分析（递归下降，带位置的错误）
+  main.py        FastAPI 应用与路由（POST /v1/evaluate、POST /v1/invert、GET /healthz）
+  models.py      请求/响应模型（有限数值校验、区间长度校验）
+  expression.py  算式词法/语法分析（递归下降，带位置的错误；AST 变量遍历）
   evaluator.py   量纲求值语义（温度规则、零除、目标换算）
+  solver.py      目标值反求：端点检查 + 异号括区二分（最多 100 次，容差 1e-8）
   units.py       Pint 注册表、受支持单位、温度仿射换算、目标单位解析
   errors.py      可定位的领域错误（统一映射为 422）
 tests/
-  test_api.py    端到端行为测试
+  test_api.py          /v1/evaluate 端到端行为测试
+  test_invert_api.py   /v1/invert 端到端行为测试
 Dockerfile
 docker-compose.yml
 requirements.txt / requirements-dev.txt

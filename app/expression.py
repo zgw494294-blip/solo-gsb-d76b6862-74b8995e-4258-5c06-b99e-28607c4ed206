@@ -173,3 +173,14 @@ def parse_expression(expression: str):
     if tokens[0].kind == "eof":
         raise EvalError.at_expression("syntax_error", 0, "算式为空")
     return _Parser(tokens).parse()
+
+
+def iter_variables(node):
+    """深度优先遍历 AST，产出其中的所有 Var 节点（含重复出现）。"""
+    if isinstance(node, Var):
+        yield node
+    elif isinstance(node, Unary):
+        yield from iter_variables(node.operand)
+    elif isinstance(node, Bin):
+        yield from iter_variables(node.left)
+        yield from iter_variables(node.right)
