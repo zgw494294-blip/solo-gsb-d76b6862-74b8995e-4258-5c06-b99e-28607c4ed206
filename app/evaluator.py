@@ -142,13 +142,19 @@ def _muldiv(left: Value, right: Value, op: str, pos: int) -> Value:
     return Value.general(left.quantity * right.quantity)
 
 
-def convert_result(value: Value, target: TargetUnit) -> tuple[float, str]:
+def convert_result(
+    value: Value,
+    target: TargetUnit,
+    loc_prefix: tuple[str, ...] = ("body", "target_unit"),
+) -> tuple[float, str]:
     """把结果换算到目标单位，返回 (数值, 量纲字符串)。"""
     if value.is_absolute:
         if target.absolute_unit is None:
             raise EvalError.at_target(
                 "incompatible_units",
                 f"结果是绝对温度，只能换算到 K/degC/degF，不能换算为 {target.raw!r}",
+                None,
+                loc_prefix,
             )
         kelvin = absolute_to_kelvin(value.abs_magnitude, value.abs_unit)
         magnitude = kelvin_to_absolute(kelvin, target.absolute_unit)
@@ -158,6 +164,8 @@ def convert_result(value: Value, target: TargetUnit) -> tuple[float, str]:
             raise EvalError.at_target(
                 "incompatible_units",
                 f"结果不是绝对温度，不能换算为绝对温度单位 {target.absolute_unit!r}",
+                None,
+                loc_prefix,
             )
         try:
             converted = value.quantity.to(target.pint_unit)
@@ -165,6 +173,8 @@ def convert_result(value: Value, target: TargetUnit) -> tuple[float, str]:
             raise EvalError.at_target(
                 "incompatible_units",
                 f"结果量纲 {value.quantity.dimensionality} 与目标单位 {target.raw!r} 不兼容",
+                None,
+                loc_prefix,
             )
         magnitude = float(converted.magnitude)
         dimension = str(converted.dimensionality)

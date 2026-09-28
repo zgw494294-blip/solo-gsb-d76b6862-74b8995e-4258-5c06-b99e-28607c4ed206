@@ -29,6 +29,8 @@ DELTA_TEMP_UNITS = {"delta_K", "delta_degC", "delta_degF"}
 ALLOWED_UNITS = (
     LENGTH_UNITS | TIME_UNITS | MASS_UNITS | ABSOLUTE_TEMP_UNITS | DELTA_TEMP_UNITS
 )
+# 变量单位：除单位表外，额外允许 1 表示无量纲数值（主要供反求接口使用）。
+VARIABLE_UNITS = ALLOWED_UNITS | {"1"}
 
 # 绝对温度单位 -> 同刻度的温差单位
 DELTA_OF_ABSOLUTE = {"K": "delta_K", "degC": "delta_degC", "degF": "delta_degF"}
@@ -124,9 +126,13 @@ class _UPow:
 class _TargetParser:
     """u_expr := u_term (('*'|'/') u_term)* ; u_term := u_factor (POW 整数)?"""
 
-    def __init__(self, tokens: list[_UToken]) -> None:
+    def __init__(self, tokens: list[_UToken], loc_prefix: tuple[str, ...]) -> None:
         self._tokens = tokens
         self._i = 0
+        self._loc_prefix = loc_prefix
+
+    def _err(self, msg: str, pos: int) -> EvalError:
+        return EvalError.at_target("invalid_target_unit", msg, pos, self._loc_prefix)
 
     def _peek(self) -> _UToken:
         return self._tokens[self._i]
@@ -140,10 +146,8 @@ class _TargetParser:
         node = self._expr()
         tok = self._peek()
         if tok.kind != "eof":
-            raise EvalError.at_target(
-                "invalid_target_unit",
-                f"目标单位在位置 {tok.pos} 附近有多余内容 {tok.text!r}",
-                tok.pos,
+            raise self._err(
+                f"目标单位在位置 {tok.pos} 附近有多余内容 {tok.text!r}", tok.pos
             )
         return node
 
@@ -172,10 +176,8 @@ class _TargetParser:
             sign = -1 if tok.text == "-" else 1
             tok = self._peek()
         if tok.kind != "number" or not tok.text.isdigit():
-            raise EvalError.at_target(
-                "invalid_target_unit",
-                f"目标单位在位置 {tok.pos} 处的指数必须是整数",
-                tok.pos,
+            raise self._err(
+                f"目标单位在位置 {tok.pos} 处的指数必须是整数", tok.pos
             )
         self._next()
         return sign * int(tok.text)
@@ -189,8 +191,7 @@ class _TargetParser:
             if tok.text == "1":
                 self._next()
                 return _UOne(tok.pos)
-            raise EvalError.at_target(
-                "invalid_target_unit",
+            raise self._err(
                 f"目标单位只允许数字 1（无量纲），位置 {tok.pos} 处的 {tok.text!r} 不允许",
                 tok.pos,
             )
@@ -201,15 +202,11 @@ class _TargetParser:
             if closing.kind == "op" and closing.text == ")":
                 self._next()
                 return node
-            raise EvalError.at_target(
-                "invalid_target_unit",
-                f"目标单位在位置 {closing.pos} 处缺少右括号",
-                closing.pos,
+            raise self._err(
+                f"目标单位在位置 {closing.pos} 处缺少右括号", closing.pos
             )
-        raise EvalError.at_target(
-            "invalid_target_unit",
-            f"目标单位在位置 {tok.pos} 处应为单位符号、1 或括号",
-            tok.pos,
+        raise self._err(
+            f"目标单位在位置 {tok.pos} 处应为单位符号、1 或括号", tok.pos
         )
 
 
@@ -266,8 +263,13 @@ def _format_unit(node) -> str:
     raise AssertionError(f"未知目标单位节点: {node!r}")
 
 
-def parse_target(raw: str) -> TargetUnit:
-    """解析目标单位：受支持单位、1、括号、*、/ 与整数幂组成的式子。"""
+def parse_target(
+    raw: str, loc_prefix: tuple[str, ...] = ("body", "target_unit")
+) -> TargetUnit:
+    """解析目标单位：受支持单位、1、括号、*、/ 与整数幂组成的式子。
+
+    ``loc_prefix`` 决定错误 loc 的字段前缀（反求接口的目标单位位于 target.unit）。
+    """
     tokens: list[_UToken] = []
     for m in _UTOKEN_RE.finditer(raw):
         kind, text, pos = m.lastgroup, m.group(), m.start()
@@ -275,14 +277,17 @@ def parse_target(raw: str) -> TargetUnit:
             continue
         if kind == "bad":
             raise EvalError.at_target(
-                "invalid_target_unit", f"目标单位在位置 {pos} 处有非法字符 {text!r}", pos
+                "invalid_target_unit",
+                f"目标单位在位置 {pos} 处有非法字符 {text!r}",
+                pos,
+                loc_prefix,
             )
         tokens.append(_UToken(kind, text, pos))
     tokens.append(_UToken("eof", "", len(raw)))
     if tokens[0].kind == "eof":
-        raise EvalError.at_target("invalid_target_unit", "目标单位为空", 0)
+        raise EvalError.at_target("invalid_target_unit", "目标单位为空", 0, loc_prefix)
 
-    tree = _TargetParser(tokens).parse()
+    tree = _TargetParser(tokens, loc_prefix).parse()
 
     for node in _walk(tree):
         if isinstance(node, _UIdent) and node.name not in ALLOWED_UNITS:
@@ -290,6 +295,7 @@ def parse_target(raw: str) -> TargetUnit:
                 "unknown_unit",
                 f"目标单位中的单位 {node.name!r} 不受支持（位置 {node.pos}）",
                 node.pos,
+                loc_prefix,
             )
 
     absolute_unit = None
@@ -304,6 +310,7 @@ def parse_target(raw: str) -> TargetUnit:
                     f"{node.name} 是偏移温度单位，只能单独作为目标单位，"
                     f"不能出现在复合单位或幂次中（位置 {node.pos}）",
                     node.pos,
+                    loc_prefix,
                 )
 
     try:
@@ -311,7 +318,9 @@ def parse_target(raw: str) -> TargetUnit:
     except EvalError:
         raise
     except Exception as exc:  # 兜底：Pint 组合单位时的意外错误
-        raise EvalError.at_target("invalid_target_unit", f"目标单位无效：{exc}")
+        raise EvalError.at_target(
+            "invalid_target_unit", f"目标单位无效：{exc}", None, loc_prefix
+        )
 
     return TargetUnit(
         raw=raw,

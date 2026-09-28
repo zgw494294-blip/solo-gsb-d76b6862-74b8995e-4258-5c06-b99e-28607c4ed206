@@ -173,3 +173,19 @@ def parse_expression(expression: str):
     if tokens[0].kind == "eof":
         raise EvalError.at_expression("syntax_error", 0, "算式为空")
     return _Parser(tokens).parse()
+
+
+def variable_names(node) -> dict[str, int]:
+    """收集 AST 中出现的变量名 -> 首次出现位置（0 起字符偏移）。"""
+    names: dict[str, int] = {}
+    stack = [node]
+    while stack:
+        n = stack.pop()
+        if isinstance(n, Var):
+            names.setdefault(n.name, n.pos)
+        elif isinstance(n, Unary):
+            stack.append(n.operand)
+        elif isinstance(n, Bin):
+            stack.append(n.right)
+            stack.append(n.left)
+    return names

@@ -24,8 +24,14 @@ class EvalError(Exception):
         return cls(type_, loc, msg)
 
     @classmethod
-    def at_target(cls, type_: str, msg: str, pos: int | None = None) -> "EvalError":
-        loc = ["body", "target_unit"] + ([] if pos is None else [pos])
+    def at_target(
+        cls,
+        type_: str,
+        msg: str,
+        pos: int | None = None,
+        prefix: tuple[str, ...] = ("body", "target_unit"),
+    ) -> "EvalError":
+        loc = list(prefix) + ([] if pos is None else [pos])
         return cls(type_, loc, msg)
 
     @classmethod
